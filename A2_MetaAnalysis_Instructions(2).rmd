@@ -1,0 +1,397 @@
+---
+title: "Assignment 2 - Meta-analysis of pitch in schizophrenia"
+author: "Riccardo Fusaroli"
+date: "16/8/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Assignment 2: meta-analysis
+
+## Questions to be answered
+
+1. Simulate data to setup the analysis and gain insight on the structure of the problem. 
+Simulate:
+One data set of *100 studies* with a *mean effect size of 0.4*, *average deviation by study of 0.4* and *measurement error of 0.8*. 
+
+N of participants should follow a *normal distribution* with *mean of 20*, *SD of 10*, but *no fewer than 10 participants)*.
+
+The data should consist of:
+a) one row per study, with an *effect size mean* and *standard error*. 
+Then:
+b) Build a proper Bayesian model to analyze the *simulated data*. 
+c) Then simulate *publication bias* (only some of the studies you simulate are likely to be published, which?), the *effect of publication bias on your estimates* (re-run the model on published studies, assess the difference), 
+d) Discuss what this implies for your model. 
+e) Use at least one plot to visualize your results. 
+
+BONUS question: do a power/precision analysis: w this kind of sample sizes (participants) how many studies would you need to acquire good precision (e.g. .1 sd in the pop level estimate)
+
+
+```{r}
+#Loading the packages
+pacman::p_load(tidyverse, dplyr, tidybayes, ggplot2, ggridges, plyr, brms, cmdstanr, gridExtra, readxl)
+```
+
+
+# Question 1
+
+```{r}
+set.seed(578)
+
+#Parameters for the simulation:
+EffectMean <- 0.4                                                               #Effect between the populations. Effect size in the simulation
+StudySD <- 0.4                                                                  #Difference between single studies. Average deviation by study
+error <- 0.8                                                                    #Error of measuring the pitch in voice.
+
+#Simulations
+Studies <- 100                                                                  #Simulating data set of 100 studies.
+
+#How many participants each study will sample.
+#Positive number of individuals per each study: defining the data frame
+d <- tibble(
+  Study = seq(Studies),
+  Participants = round(msm::rtnorm(Studies, 20, 10, lower = 10), 0), 
+  EffectMu = NA, #effect size
+  EffectSigma = NA, #uncertainty of the study
+  StudyEffect = NA,
+  Published = NA, #whether the study is published or not, will be simulated later 
+  PublishedPos = NA
+)
+
+```
+
+Simulating the effect size,  mean and standard error
+```{r}
+for (i in seq(Studies)) {
+  d$StudyEffect[i] <- rnorm(1, EffectMean, StudySD)
+  sampling <- rnorm(d$Participants[i], d$StudyEffect[i], error)
+  d$EffectMu[i] <- mean(sampling)
+  d$EffectSigma[i] <- sd(sampling)/sqrt(d$Participants[i]) #Standard error
+  d$Published[i] <- ifelse(
+    abs(d$EffectMu[i]) - (2*d$EffectSigma[i]) > 0, #If study is significant, it gets published by 90%
+    rbinom(1, 1, .9), rbinom(1, 1, .1)) #if study is not significant, it gets published with prob. of 10%
+  d$PublishedPos[i] <- ifelse(
+    abs(d$EffectMu[i]) - (2*d$EffectSigma[i]) > 0 & d$EffectMu[i] > 0,  #
+    rbinom(1, 1, .9), rbinom(1, 1, .1))  
+}
+
+pub_bias_all <- ggplot(d) +
+aes(x = EffectMu) +
+geom_histogram(bins = 30L, fill = "#E68613", color = "#E68613", alpha = 0.3) +
+labs(title = "Pub bias: all studies") + 
+geom_vline(xintercept = 0, color="black") +
+theme_minimal() +
+theme(plot.title = element_text(size = 18L, face = "bold"))
+
+pub_bias_1 <- ggplot(subset(d, Published == 1)) +
+aes(x = EffectMu) +
+geom_histogram(bins = 30L, fill = "#E68613", color = "#E68613", alpha = 0.3) +
+labs(title = "Pub bias: Published = 1") + 
+geom_vline(xintercept = 0, color="black") +
+theme_minimal() +
+theme(plot.title = element_text(size = 18L, face = "bold"))
+
+pub_bias_pubpos_1 <- ggplot(subset(d, PublishedPos == 1)) +
+aes(x = EffectMu) +
+geom_histogram(bins = 30L, fill = "#E68613", color = "#E68613", alpha = 0.3) +
+labs(title = "Pub bias: PublishedPos = 1") + 
+geom_vline(xintercept = 0, color="black") +
+theme_minimal() +
+theme(plot.title = element_text(size = 18L, face = "bold"))
+
+pub_bias_all
+pub_bias_1
+pub_bias_pubpos_1
+```
+
+
+*Meta-analytic multilevel modeling*
+```{r}
+f1 <- bf(EffectMu | se(EffectSigma) ~ 1 + (1 | Study))
+get_prior(f1, d, gaussian)
+```
+
+
+*Setting priors on the underlying level and not the data itself*
+```{r}
+model_1_p <- c(
+  prior(normal(0, 0.3), class = Intercept), #average undelying distribution of effects, any effect between -0.6 and 0.6 is possible.
+  prior(normal(0, 0.3), class = sd) #how much on average the studies will deviate from each other. Uncertainty of the studies.
+)
+```
+
+
+*Plotting prior-predictive model*
+```{r}
+model_1_prior <- brm( 
+  f1, 
+  data = d, 
+  family = gaussian,
+  prior = model_1_p, 
+  sample_prior = "only", 
+  backend = "cmdstanr",
+  threads = threading(2), 
+  chains = 2, 
+  core = 2, 
+  control = list(adapt_delt = 0.99, max_treedepth = 20))
+update(model_1_prior)
+pp_check(model_1_prior, ndraws=100) + labs(title = "Prior-predictive check")
+```
+
+
+*Plotting posterior-predictive models*
+```{r}
+#Fitting the models on full data set and the two publication biases
+model_1_post <- brm( 
+  f1, 
+  data = d, 
+  family = gaussian,
+  prior = model_1_p, 
+  sample_prior = T, 
+  backend = "cmdstanr",
+  threads = threading(2), 
+  chains = 2, 
+  core = 2, 
+  control = list(adapt_delt = 0.99, max_treedepth = 20))
+
+m1 <- pp_check(model_1_post, ndraws=100) + labs(title = "Posterior-predictive check")
+m1
+model_1_post_pub <- update(model_1_post, newdata = subset(d, Published == 1))
+model_1_post_pubpos <- update(model_1_post, newdata = subset(d, PublishedPos == 1))
+
+m2 <- pp_check(model_1_post_pub, ndraws = 100) + labs(title = "Posterior-predictive check, Published = 1") #creating plot
+m3 <- pp_check(model_1_post_pubpos, ndraws = 100) + labs(title = "Posterior-predictive check, PublishedPos = 1")#creating plot
+
+grid.arrange(m1, m2, m3)
+
+m3
+```
+
+*Plotting the estimates of these models*
+
+
+
+```{r}
+posterior_2 <- as_draws_df(model_1_post)
+variables(posterior_2)
+model_1_post_pub_draws <- as_draws_df(model_1_post_pub)
+
+model_1_post_pubpos_draws <- as_draws_df(model_1_post_pubpos)
+
+mod_1_df <- tibble(
+  Model = "1",
+  mean_est = mean(posterior_2$b_Intercept),
+  upper = quantile(posterior_2$b_Intercept, 0.975), 
+  lower = quantile(posterior_2$b_Intercept, 0.025)
+)
+
+mod_2_df <- tibble(
+  Model = "2",
+  mean_est = mean(model_1_post_pub_draws$b_Intercept),
+  upper = quantile(model_1_post_pub_draws$b_Intercept, 0.975), 
+  lower = quantile(model_1_post_pub_draws$b_Intercept, 0.025)
+)
+
+mod_3_df <- tibble(
+  Model = "3",
+  mean_est = mean(model_1_post_pubpos_draws$b_Intercept),
+  upper = quantile(model_1_post_pubpos_draws$b_Intercept, 0.975), 
+  lower = quantile(model_1_post_pubpos_draws$b_Intercept, 0.025)
+)
+
+df_models_draws <- rbind(mod_1_df, mod_2_df, mod_3_df)
+
+
+plots_est_p2 <- ggplot(df_models_draws) +
+  geom_pointrange(aes(x= Model,y= mean_est,
+                      ymin=lower,ymax=upper,
+                      color = Model),alpha= 1) +
+  xlab("Model") +
+  ylab("Estimate")
+#plots_est_p2
+#model_p2_draws <- as_draws_df(model_p2_post)
+
+
+plot1 <- ggplot(posterior_2) +
+  geom_histogram(aes(prior_sd_Study), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(sd_Study__Intercept), fill="#E68613", color="#E68613",alpha=0.6) + #Posterior
+  theme_classic() +
+   xlab("Prior-posterior update check on standard deviation")
+
+plot2 <- ggplot(posterior_2) +
+  geom_histogram(aes(prior_Intercept), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_Intercept), fill="#E68613", color="#E68613",alpha=0.6) + #Posterior
+  theme_classic() +
+   xlab("Prior-posterior update check on intercept")
+grid.arrange(plot1, plot2)
+```
+
+
+## Question 2
+2. What is the current evidence for distinctive vocal patterns in schizophrenia? 
+Use the data from Parola et al (2020) - https://www.dropbox.com/s/0l9ur0gaabr80a8/Matrix_MetaAnalysis_Diagnosis_updated290719.xlsx?dl=0 - focusing on pitch variability (PITCH_F0SD).
+
+2.1) Describe the data available (studies, participants).
+2.2) Using the model from question 1 analyze the data, visualize and report the findings: population level effect size; how well studies reflect it; influential studies, publication bias.
+
+```{r}
+#Loading the data in:
+ass_2_d <- read_excel("Matrix_MetaAnalysis_Diagnosis_updated290719.xlsx")
+```
+
+
+Variables:
+- HC - healthy controls
+- F0 = Fundamental frequency (frequency of oscillation produced by tension of vocal folds during speech). Measured in seconds/Hz. Corresponds roughly to perceived pitch of speech.
+
+
+Describe the data:
+```{r}
+ass_2_d$StudyID <- as.factor(ass_2_d$StudyID)
+length(levels(ass_2_d$StudyID)) #50 studies
+
+#Changing variables from chr to num so I could compare them.
+#For sample size:
+ass_2_d$MALE_SZ <- as.numeric(ass_2_d$MALE_SZ)
+ass_2_d$FEMALE_SZ <- as.numeric(ass_2_d$FEMALE_SZ)
+
+ass_2_d$MALE_HC <- as.numeric(ass_2_d$MALE_HC)
+ass_2_d$FEMALE_HC <- as.numeric(ass_2_d$FEMALE_HC)
+
+#For age:
+ass_2_d$AGE_M_SZ <- as.numeric(ass_2_d$AGE_M_SZ)
+ass_2_d$AGE_SD_SZ <- as.numeric(ass_2_d$AGE_SD_SZ)
+
+ass_2_d$AGE_M_HC <- as.numeric(ass_2_d$AGE_M_HC)
+ass_2_d$AGE_SD_HC <- as.numeric(ass_2_d$AGE_SD_HC)
+
+summary(ass_2_d)
+```
+
+Data analysis: (Focus on pitch variability: PITCH_F0_HC_SD and PITCH_F0_SZ_SD for control and schizophrenic group.)
+
+
+```{r}
+library(metafor)
+
+#Converting existing outcomes of the studies to Cohen's D:
+Outcome_ES <- escalc('SMD',
+  n1i = SAMPLE_SIZE_SZ, n2i = SAMPLE_SIZE_HC,
+  m1i = PITCH_F0_SZ_M, m2i=PITCH_F0_HC_M,
+  sd1i = PITCH_F0_SZ_SD, sd2i=PITCH_F0_HC_SD,
+  data = ass_2_d)
+```
+
+Yi - The EffectMu
+Vi - Standard error
+
+
+Defining the formula for the model:
+```{r}
+study_effect_emp <- ggplot(Outcome_ES) +
+aes(x = yi) +
+geom_histogram(bins = 30L, fill = "#E68613", color = "#E68613", alpha = 0.3) +
+labs(title = "Effect of empirical data") + 
+geom_vline(xintercept = 0, color="black") +
+theme_minimal() +
+theme(plot.title = element_text(size = 18L, face = "bold"))
+study_effect_emp
+
+pitch_data_f <- bf(yi | se(vi) ~ 1 + (1 | StudyID))
+get_prior(pitch_data_f, data = Outcome_ES, gaussian)
+
+#Same as in the model above
+model_2_priors <- c(
+  prior(normal(0, 0.3), class = Intercept),
+  prior(normal(0, 0.3), class = sd)
+)
+
+model_p2_prior <- brm( 
+  pitch_data_f, 
+  data = Outcome_ES, 
+  family = gaussian,
+  prior = model_2_priors, 
+  sample_prior = "only", 
+  backend = "cmdstanr",
+  threads = threading(2), 
+  chains = 2, 
+  core = 2, 
+  control = list(adapt_delt = 0.99, max_treedepth = 20))
+update(model_p2_prior)
+pp_check(model_p2_prior, ndraws=100) + labs(title = "Prior-predictive check, empirical data")
+
+
+model_p2_post <- brm( 
+  pitch_data_f, 
+  data = Outcome_ES, 
+  family = gaussian,
+  prior = model_2_priors, 
+  sample_prior = T, 
+  backend = "cmdstanr",
+  threads = threading(2), 
+  chains = 2, 
+  core = 2, 
+  control = list(adapt_delt = 0.99, max_treedepth = 20))
+update(model_p2_post)
+pp_check(model_p2_post, ndraws=100) + labs(title = "Posterior-predictive check, empirical data")
+```
+
+
+Posterior:
+```{r}
+model_p2_draws <- as_draws_df(model_p2_post)
+variables(model_p2_draws)
+
+plot1_emp <- ggplot(model_p2_draws) +
+  geom_histogram(aes(prior_sd_StudyID), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(sd_StudyID__Intercept), fill="#E68613", color="#E68613",alpha=0.6) + #Posterior
+  theme_classic() +
+   xlab("Prior-posterior update check on standard deviation")
+
+plot2_emp <- ggplot(model_p2_draws) +
+  geom_histogram(aes(prior_Intercept), fill="black", color="black",alpha=0.6,) +
+  geom_histogram(aes(b_Intercept), fill="#E68613", color="#E68613",alpha=0.6) + #Posterior
+  theme_classic() +
+   xlab("Prior-posterior update check on intercept")
+
+grid.arrange(plot1_emp, plot2_emp)
+#??train
+
+```
+
+
+
+```{r}
+pub_bias_real_d <- ggplot(Outcome_ES) +
+aes(x = yi) +
+geom_histogram(bins = 30L, fill = "#E68613", color = "#E68613", alpha = 0.3) +
+labs(title = "Plot of the empirical data") + 
+geom_vline(xintercept = 0, color="black") +
+theme_minimal() +
+theme(plot.title = element_text(size = 18L, face = "bold")) +
+xlab("Effect size mean")
+pub_bias_real_d
+
+summary(model_p2_post) #population level effect size. #forest plot
+```
+
+
+Forest plot:
+```{r}
+ggplot(Outcome_ES, aes(y=StudyID, x=yi, 
+                             xmin=error_lower, 
+                             xmax=error_upper)) + 
+  geom_point( color= "red", pch= 9, size=3)+
+  geom_errorbarh(height=.1, color= "green", lwd=1.2) +
+  # scale_y_continuous(labels=sample_data$study)+
+  labs(title="Forest Plot")+
+  geom_vline(xintercept=0, color='blue', linetype='dashed', alpha=.5)
+```
+
+```{r}
+mean(Outcome_ES$yi)
+```
+
